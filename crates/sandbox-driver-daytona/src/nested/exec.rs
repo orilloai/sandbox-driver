@@ -9,7 +9,7 @@ use std::{io, mem};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    BASH_ENV_VAR, Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
+    BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
     OutputSink, Pty, PtyOptions, PtySession, PtySize, Result, SpawnSpec, StdioProcess,
     StdioProcessHandle, StopLevel, Termination, drain_with_stops, run_with_stop_grace,
 };
@@ -46,7 +46,9 @@ impl Job {
         }
     }
 
-    fn command(&self, spec: &ExecSpec) -> ExecSpec {
+    /// `forward_stdin` keeps the wrapper's descriptor 0 open for the command:
+    /// fixed bytes ride the spec, streamed stdin rides the transport call.
+    fn command(&self, spec: &ExecSpec, forward_stdin: bool) -> ExecSpec {
         let mut args = vec!["exec".to_owned(), "-i".to_owned(), "--workdir".to_owned()];
         args.push(self.cli.resolve(spec.working_dir.as_deref().unwrap_or(".")));
         args.extend(["--env".to_owned(), format!("{BASH_ENV_VAR}=")]);
@@ -54,7 +56,7 @@ impl Job {
         args.extend([
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            DockerExec::command_wrapper(&self.stop_file, &self.pid_file, spec.stdin.is_some()),
+            DockerExec::command_wrapper(&self.stop_file, &self.pid_file, forward_stdin),
             "sandbox-driver".to_owned(),
         ]);
         args.extend(
@@ -175,15 +177,13 @@ impl Exec for NestedExec {
 
 impl NestedExec {
     /// Runs the command under raw stop signals; the trait method wraps
-    /// this in the spec's stop grace.
+    /// this in the spec's stop grace. Streamed stdin is handed to the
+    /// native transport, which feeds `docker exec -i`.
     async fn run_signals(
         &self,
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
-        if controls.stdin.is_some() {
-            return Err(Error::unsupported(Capability::ExecStdinStream));
-        }
         let stopped = if controls
             .kill
             .as_ref()
@@ -209,7 +209,7 @@ impl NestedExec {
             )));
         }
         let job = Job::new(Arc::clone(&self.cli));
-        let command = job.command(spec);
+        let command = job.command(spec, spec.stdin.is_some() || controls.stdin.is_some());
         let sink_failed = CancellationToken::new();
         let sink = controls.sink.as_ref().map(|sink| {
             let sink = Arc::clone(sink);
@@ -231,6 +231,8 @@ impl NestedExec {
         let mut run = pin!(self.cli.exec.run_streaming(&command, ExecControls {
             sink,
             kill: Some(transport_kill.clone()),
+            // The native session transport streams stdin to `docker exec -i`.
+            stdin: controls.stdin.clone(),
             retained_output_limit: controls.retained_output_limit,
             ..ExecControls::default()
         }));
@@ -279,7 +281,7 @@ impl NestedExec {
         command.working_dir.clone_from(&spec.working_dir);
         // The wrapper must preserve the interactive stdin descriptor.
         command.stdin = Some(Vec::new());
-        let command = job.command(&command);
+        let command = job.command(&command, true);
         let mut spawn = SpawnSpec::new(command.program).args(command.args);
         spawn.env = command.env;
         spawn.working_dir = command.working_dir;
@@ -528,9 +530,13 @@ impl Drop for NestedPtySession {
 #[cfg(test)]
 mod tests {
     use std::process::Command;
+    use std::sync::Mutex as StdMutex;
     use std::{env, fs};
 
+    use sandbox_driver::StdinSource;
+
     use super::*;
+    use crate::{DaytonaConfig, DaytonaProvider};
 
     #[test]
     fn a_late_term_request_cannot_downgrade_a_kill() {
@@ -555,5 +561,96 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&dir).expect("control files").count(), 1);
         fs::remove_dir_all(dir).expect("remove test control directory");
+    }
+
+    /// Records the Docker commands the nested layer sends over the native
+    /// transport, and whether each carried streamed stdin.
+    #[derive(Default)]
+    struct Recorder {
+        calls: StdMutex<Vec<(ExecSpec, bool)>>,
+    }
+
+    #[async_trait]
+    impl Exec for Recorder {
+        async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
+            self.run_streaming(spec, ExecControls::buffered())
+                .await?
+                .into_complete()
+        }
+
+        async fn run_streaming(
+            &self,
+            spec: &ExecSpec,
+            controls: ExecControls,
+        ) -> Result<ExecStreamingResult> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((spec.clone(), controls.stdin.is_some()));
+            // Exited at once, so the nested run neither waits nor stops the job.
+            Ok(ExecStreamingResult::new(ExecResult::new(
+                Termination::Exited,
+                Some(0),
+                Duration::ZERO,
+            )))
+        }
+    }
+
+    async fn nested_over_recorder() -> (NestedExec, Arc<Recorder>) {
+        let provider = DaytonaProvider::connect_with_config(DaytonaConfig {
+            api_key: Some("test-key".to_owned()),
+            api_url: Some("https://daytona.example/api".to_owned()),
+            ..DaytonaConfig::default()
+        })
+        .await
+        .unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let mut cli = DockerCli::new(&provider.client, "test-sandbox", "/workspace");
+        cli.exec = Arc::clone(&recorder) as Arc<dyn Exec>;
+        (NestedExec::new(Arc::new(cli)), recorder)
+    }
+
+    /// The `/bin/sh -c` script of the one recorded `docker exec`.
+    fn wrapper_of(recorder: &Recorder) -> (String, bool) {
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one docker exec, no stop request");
+        let (spec, streamed) = &calls[0];
+        let script = spec
+            .args
+            .iter()
+            .position(|arg| arg == "-c")
+            .and_then(|index| spec.args.get(index + 1))
+            .expect("wrapper script");
+        (script.clone(), *streamed)
+    }
+
+    #[tokio::test]
+    async fn streamed_stdin_reaches_the_docker_exec_transport() {
+        let (nested, recorder) = nested_over_recorder().await;
+        let controls = ExecControls {
+            stdin: Some(StdinSource::new(io::Cursor::new(b"x".to_vec()))),
+            ..ExecControls::buffered()
+        };
+        nested
+            .run_streaming(&ExecSpec::new("cat"), controls)
+            .await
+            .expect("streamed stdin is supported");
+        let (script, streamed) = wrapper_of(&recorder);
+        assert!(streamed, "the inner call carries the stdin source");
+        assert!(script.contains("exec 3<&0"));
+        assert!(!script.contains("< /dev/null"));
+    }
+
+    #[tokio::test]
+    async fn without_stdin_the_wrapper_reads_dev_null() {
+        let (nested, recorder) = nested_over_recorder().await;
+        nested
+            .run_streaming(&ExecSpec::new("true"), ExecControls::buffered())
+            .await
+            .expect("plain run");
+        let (script, streamed) = wrapper_of(&recorder);
+        assert!(!streamed);
+        assert!(script.contains("< /dev/null"));
+        assert!(!script.contains("exec 3<&0"));
     }
 }

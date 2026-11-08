@@ -357,7 +357,6 @@ impl NestedDocker {
     pub(super) fn capabilities(&self, caps: &mut Capabilities) {
         caps.one_shot = Some(one_shot_capabilities());
         if self.targets_container() {
-            caps.exec.stdin_stream = false;
             caps.fs.native = false;
             caps.git.native = false;
             caps.logs = None;
@@ -854,6 +853,15 @@ mod tests {
             assert_eq!(caps.supports(Capability::SignedPreviewUrls), vm);
         }
     }
+    #[tokio::test]
+    async fn container_target_keeps_streamed_stdin() {
+        let nested = fake_nested(|_| response(0, "")).await;
+        let mut caps = daytona_capabilities();
+        caps.exec.stdin_stream = true;
+        nested.capabilities(&mut caps);
+        assert!(caps.exec.stdin_stream);
+    }
+
     struct FakeExec {
         reply: Box<dyn Fn(&ExecSpec) -> ExecResult + Send + Sync>,
     }
